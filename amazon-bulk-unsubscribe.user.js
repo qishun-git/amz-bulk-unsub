@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon Subscribe & Save Bulk Unsubscribe
 // @namespace    local.amazon.bulk.unsubscribe
-// @version      0.1.6
+// @version      0.2.7
 // @description  Bulk unsubscribe subscriptions on Amazon (supports manager page by redirecting to subscription list).
 // @match        https://www.amazon.com/auto-deliveries/subscriptionList*
 // @match        https://www.amazon.com/auto-deliveries/viewsubscriptions*
@@ -36,12 +36,15 @@
       /\bcancel\b.*\b(subscription|auto[-\s]?delivery|delivery)\b/i,
       /\bend\b.*\bsubscription\b/i
     ],
-    waitTimeoutMs: 20000,
+    waitTimeoutMs: 45000,
     pollMs: 300,
     clickPauseMs: 900,
     betweenItemsPauseMs: 1400,
     resumeFindTimeoutMs: 22000,
     resumePollMs: 700,
+    observerRefreshMs: 5000,
+    scrollNudgeMs: 4000,
+    redirectedPageLockMs: 1200,
     maxLogLines: 14
   };
 
@@ -56,6 +59,7 @@
   const COMPLETION_REDIRECT_GUARD_KEY = '__amzBulkUnsubCompletionRedirectAt';
   const CANCEL_LANDING_REDIRECT_GUARD_KEY = '__amzBulkUnsubCancelLandingRedirectAt';
   const LAST_SUBSCRIPTION_URL_KEY = '__amzBulkUnsubLastSubscriptionUrlV1';
+  const RUN_LOCK_KEY = '__amzBulkUnsubRunLockV1';
   const BULK_JOB_STORAGE_KEY = '__amzBulkUnsubJobV1';
   const BULK_JOB_VERSION = 1;
 
@@ -72,6 +76,9 @@
     statusEl: null,
     runBtn: null,
     stopBtn: null,
+    lockEl: null,
+    keyboardGuardBound: false,
+    pointerGuardBound: false,
     logEl: null,
     logLines: []
   };
@@ -284,6 +291,21 @@
     return false;
   }
 
+  function redirectWithLockDelay(targetUrl, delayMs = CONFIG.redirectedPageLockMs) {
+    const target = normalizeUrl(targetUrl || '');
+    if (!target) return false;
+    const delay = Math.max(0, Number(delayMs) || 0);
+    if (delay === 0) {
+      location.assign(target);
+      return true;
+    }
+
+    setTimeout(() => {
+      location.assign(target);
+    }, delay);
+    return true;
+  }
+
   function findSubscriptionListUrl() {
     const links = Array.from(document.querySelectorAll('a[href]'))
       .map((a) => a.getAttribute('href'))
@@ -371,6 +393,13 @@
     }
   }
 
+  function hasActiveStoredJob() {
+    const job = readStoredJob();
+    if (!job) return false;
+    const pending = Array.isArray(job.pending) ? job.pending.length : 0;
+    return pending > 0;
+  }
+
   function writeStoredJob(job) {
     if (!job) return;
     try {
@@ -430,8 +459,7 @@
     if (normalizeUrl(target) === normalizeUrl(location.href)) return false;
     if (shouldThrottleRedirect(RESUME_REDIRECT_GUARD_KEY, target)) return false;
 
-    location.assign(target);
-    return true;
+    return redirectWithLockDelay(target);
   }
 
   function writeCompletionReturnUrl(targetUrl) {
@@ -469,6 +497,48 @@
     }
   }
 
+  function hasCompletionRedirectIntent() {
+    return !!readCompletionReturnUrl();
+  }
+
+  function writeRunLockFlag(ttlMs = 10 * 60 * 1000) {
+    const ttl = Math.max(1000, Number(ttlMs) || 0);
+    try {
+      sessionStorage.setItem(
+        RUN_LOCK_KEY,
+        JSON.stringify({
+          expiresAt: Date.now() + ttl
+        })
+      );
+    } catch {
+      // Ignore storage write errors.
+    }
+  }
+
+  function hasRunLockFlag() {
+    try {
+      const raw = sessionStorage.getItem(RUN_LOCK_KEY);
+      if (!raw) return false;
+      const parsed = JSON.parse(raw);
+      const expiresAt = Number(parsed && parsed.expiresAt ? parsed.expiresAt : 0);
+      if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) {
+        sessionStorage.removeItem(RUN_LOCK_KEY);
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function clearRunLockFlag() {
+    try {
+      sessionStorage.removeItem(RUN_LOCK_KEY);
+    } catch {
+      // Ignore storage issues.
+    }
+  }
+
   function clearCompletionReturnUrl() {
     try {
       sessionStorage.removeItem(COMPLETION_RETURN_KEY);
@@ -491,8 +561,7 @@
 
     if (shouldThrottleRedirect(COMPLETION_REDIRECT_GUARD_KEY, target)) return false;
 
-    location.assign(target);
-    return true;
+    return redirectWithLockDelay(target);
   }
 
   function maybeRedirectFromCancelLanding() {
@@ -512,8 +581,7 @@
     if (normalizeUrl(target) === normalizeUrl(location.href)) return false;
     if (shouldThrottleRedirect(CANCEL_LANDING_REDIRECT_GUARD_KEY, target, 10000)) return false;
 
-    location.assign(target);
-    return true;
+    return redirectWithLockDelay(target);
   }
 
   function buildJobStatusText(job, stoppedEarly = false) {
@@ -666,10 +734,22 @@
     return fallback;
   }
 
-  function removeOldOverlays() {
-    document.querySelectorAll('.amz-bulk-unsub-checkbox').forEach((el) => el.remove());
+  function cleanupStaleOverlays(validSubscriptions) {
+    const validIds = new Set(validSubscriptions.map((item) => item.id));
+    const validCards = new Set(validSubscriptions.map((item) => item.card));
+
+    document.querySelectorAll('.amz-bulk-unsub-checkbox').forEach((el) => {
+      const id = normalizeText(el.getAttribute('data-amz-id') || '');
+      const card = el.closest('.amz-bulk-unsub-card, .subscription-card-item, .subscription-card');
+      if (!id || !validIds.has(id) || !card || !validCards.has(card)) {
+        el.remove();
+      }
+    });
+
     document.querySelectorAll('.amz-bulk-unsub-card').forEach((card) => {
-      card.classList.remove('amz-bulk-unsub-card', 'amz-bulk-unsub-selected');
+      if (!validCards.has(card)) {
+        card.classList.remove('amz-bulk-unsub-card', 'amz-bulk-unsub-selected');
+      }
     });
   }
 
@@ -754,31 +834,51 @@
       card.style.position = 'relative';
     }
 
-    const wrap = document.createElement('label');
-    wrap.className = 'amz-bulk-unsub-checkbox';
-    // Enforce top-left placement even if page styles override class rules.
-    wrap.style.setProperty('top', '10px', 'important');
-    wrap.style.setProperty('left', '10px', 'important');
-    wrap.style.setProperty('right', 'auto', 'important');
-    wrap.style.setProperty('inset-inline-start', '10px', 'important');
-    wrap.style.setProperty('inset-inline-end', 'auto', 'important');
+    let wrap = card.querySelector('.amz-bulk-unsub-checkbox');
+    const currentId = wrap ? normalizeText(wrap.getAttribute('data-amz-id') || '') : '';
+    if (wrap && currentId && currentId !== id) {
+      wrap.remove();
+      wrap = null;
+    }
 
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.className = 'amz-bulk-unsub-toggle';
-    checkbox.checked = STATE.selectedIds.has(id);
-    checkbox.addEventListener('change', () => onToggleSelection(id, checkbox.checked, card));
+    if (!wrap) {
+      wrap = document.createElement('label');
+      wrap.className = 'amz-bulk-unsub-checkbox';
+      // Enforce top-left placement even if page styles override class rules.
+      wrap.style.setProperty('top', '10px', 'important');
+      wrap.style.setProperty('left', '10px', 'important');
+      wrap.style.setProperty('right', 'auto', 'important');
+      wrap.style.setProperty('inset-inline-start', '10px', 'important');
+      wrap.style.setProperty('inset-inline-end', 'auto', 'important');
 
-    const label = document.createElement('span');
-    label.className = 'amz-bulk-unsub-label';
-    label.textContent = 'Select';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'amz-bulk-unsub-toggle';
+      checkbox.addEventListener('change', () => {
+        const activeId = normalizeText(wrap.getAttribute('data-amz-id') || id);
+        onToggleSelection(activeId, checkbox.checked, card);
+      });
 
+      const label = document.createElement('span');
+      label.className = 'amz-bulk-unsub-label';
+      label.textContent = 'Select';
+
+      wrap.appendChild(checkbox);
+      wrap.appendChild(label);
+      card.appendChild(wrap);
+    }
+
+    wrap.setAttribute('data-amz-id', id);
     wrap.title = title;
-    wrap.appendChild(checkbox);
-    wrap.appendChild(label);
-    card.appendChild(wrap);
-
-    if (checkbox.checked) card.classList.add('amz-bulk-unsub-selected');
+    const checkbox = wrap.querySelector('.amz-bulk-unsub-toggle');
+    if (checkbox) {
+      checkbox.checked = STATE.selectedIds.has(id);
+      if (checkbox.checked) {
+        card.classList.add('amz-bulk-unsub-selected');
+      } else {
+        card.classList.remove('amz-bulk-unsub-selected');
+      }
+    }
   }
 
   function updateCounts() {
@@ -795,8 +895,8 @@
   function refreshSubscriptions() {
     STATE.suppressObserver = true;
     try {
-      removeOldOverlays();
       const discovered = discoverSubscriptions();
+      cleanupStaleOverlays(discovered);
       STATE.subscriptions = discovered;
 
       const validIds = new Set(discovered.map((item) => item.id));
@@ -848,19 +948,23 @@
   async function waitForEntryToAppear(entry, timeoutMs = CONFIG.resumeFindTimeoutMs) {
     const start = Date.now();
     let scrollDown = false;
+    let lastNudgeAt = 0;
 
     while (Date.now() - start < timeoutMs) {
       refreshSubscriptions();
       const target = findItemForEntry(entry);
       if (target) return target;
 
-      // Nudge lazy-loaded lists in either direction while waiting.
-      if (scrollDown) {
-        window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-      } else {
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+      // Nudge lazy-loaded lists less often to reduce visible page jumping.
+      if (Date.now() - lastNudgeAt >= CONFIG.scrollNudgeMs) {
+        if (scrollDown) {
+          window.scrollTo({ top: document.body.scrollHeight, behavior: 'auto' });
+        } else {
+          window.scrollTo({ top: 0, behavior: 'auto' });
+        }
+        scrollDown = !scrollDown;
+        lastNudgeAt = Date.now();
       }
-      scrollDown = !scrollDown;
 
       await sleep(CONFIG.resumePollMs);
     }
@@ -915,14 +1019,143 @@
   function scheduleRefresh() {
     if (STATE.running || STATE.suppressObserver) return;
     clearTimeout(STATE.refreshTimer);
-    STATE.refreshTimer = setTimeout(refreshSubscriptions, 450);
+    STATE.refreshTimer = setTimeout(() => {
+      STATE.refreshTimer = null;
+      refreshSubscriptions();
+    }, CONFIG.observerRefreshMs);
+  }
+
+  function isInteractionLocked() {
+    if (STATE.running) return true;
+    if (isSubscriptionListPage()) return false;
+    return hasRunLockFlag() || hasActiveStoredJob() || hasCompletionRedirectIntent();
+  }
+
+  function setStyleImportant(el, prop, value) {
+    if (!el || !el.style) return;
+    el.style.setProperty(prop, value, 'important');
+  }
+
+  function applyLockInlineStyles() {
+    if (!STATE.lockEl) return;
+
+    const lock = STATE.lockEl;
+    setStyleImportant(lock, 'position', 'fixed');
+    setStyleImportant(lock, 'inset', '0');
+    setStyleImportant(lock, 'z-index', '2147483646');
+    setStyleImportant(lock, 'background', 'rgba(15, 23, 42, 0.12)');
+    setStyleImportant(lock, 'cursor', 'not-allowed');
+    setStyleImportant(lock, 'user-select', 'none');
+    setStyleImportant(lock, '-webkit-user-select', 'none');
+    setStyleImportant(lock, 'opacity', '1');
+
+    const message = lock.querySelector('.amz-bulk-lock-message');
+    if (!message) return;
+    setStyleImportant(message, 'position', 'fixed');
+    setStyleImportant(message, 'left', '50%');
+    setStyleImportant(message, 'top', '16px');
+    setStyleImportant(message, 'transform', 'translateX(-50%)');
+    setStyleImportant(message, 'padding', '8px 12px');
+    setStyleImportant(message, 'border-radius', '999px');
+    setStyleImportant(message, 'border', '1px solid #cbd5e1');
+    setStyleImportant(message, 'background', 'rgba(255, 255, 255, 0.96)');
+    setStyleImportant(message, 'color', '#0f172a');
+    setStyleImportant(message, 'font', '600 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif');
+    setStyleImportant(message, 'box-shadow', '0 6px 18px rgba(15, 23, 42, 0.22)');
+    setStyleImportant(message, 'pointer-events', 'none');
+    setStyleImportant(message, 'white-space', 'nowrap');
+    setStyleImportant(message, 'z-index', '2147483647');
+    setStyleImportant(message, 'display', 'block');
+  }
+
+  function setInteractionLockVisibility(locked) {
+    if (!STATE.lockEl) return;
+    setStyleImportant(STATE.lockEl, 'display', locked ? 'block' : 'none');
+    setStyleImportant(STATE.lockEl, 'pointer-events', locked ? 'auto' : 'none');
+    STATE.lockEl.setAttribute('aria-hidden', locked ? 'false' : 'true');
   }
 
   function updateButtonStates() {
     const running = STATE.running;
+    const locked = isInteractionLocked();
     if (STATE.runBtn) STATE.runBtn.disabled = running;
     if (STATE.stopBtn) STATE.stopBtn.disabled = !running;
-    document.documentElement.classList.toggle('amz-bulk-running', running);
+    document.documentElement.classList.toggle('amz-bulk-running', locked);
+    if ((locked || STATE.lockEl) && !STATE.lockEl) {
+      createInteractionLockLayer();
+    }
+    if (STATE.lockEl && !STATE.lockEl.isConnected && document.body) {
+      document.body.appendChild(STATE.lockEl);
+    }
+    if (STATE.lockEl) {
+      applyLockInlineStyles();
+      setInteractionLockVisibility(locked);
+    }
+    if (running && STATE.stopBtn) {
+      STATE.stopBtn.focus({ preventScroll: true });
+    }
+  }
+
+  function handleGlobalPointerGuard(event) {
+    if (!isInteractionLocked()) return;
+    // Allow script-generated events so automation can continue.
+    if (!event.isTrusted) return;
+    if (STATE.panel && STATE.panel.contains(event.target)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+    if (STATE.stopBtn) STATE.stopBtn.focus({ preventScroll: true });
+  }
+
+  function handleGlobalKeydownGuard(event) {
+    if (!isInteractionLocked()) return;
+    // Allow script-generated events so automation can continue.
+    if (!event.isTrusted) return;
+    if (STATE.panel && STATE.panel.contains(event.target)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+  }
+
+  function createInteractionLockLayer() {
+    if (STATE.lockEl && STATE.lockEl.isConnected) {
+      applyLockInlineStyles();
+      setInteractionLockVisibility(isInteractionLocked());
+      return;
+    }
+    const lock = document.createElement('div');
+    lock.id = 'amz-bulk-interaction-lock';
+    lock.setAttribute('aria-hidden', 'true');
+    lock.innerHTML = `<div class="amz-bulk-lock-message">Automation running. Use panel controls only.</div>`;
+
+    ['click', 'dblclick', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'touchstart', 'touchmove', 'contextmenu', 'wheel'].forEach(
+      (type) => {
+        lock.addEventListener(type, handleGlobalPointerGuard, { capture: true, passive: false });
+      }
+    );
+
+    document.body.appendChild(lock);
+    STATE.lockEl = lock;
+    applyLockInlineStyles();
+    setInteractionLockVisibility(isInteractionLocked());
+
+    if (!STATE.keyboardGuardBound) {
+      document.addEventListener('keydown', handleGlobalKeydownGuard, true);
+      STATE.keyboardGuardBound = true;
+    }
+
+    if (!STATE.pointerGuardBound) {
+      ['click', 'dblclick', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'touchstart', 'touchmove', 'contextmenu', 'wheel'].forEach(
+        (type) => {
+          document.addEventListener(type, handleGlobalPointerGuard, { capture: true, passive: false });
+        }
+      );
+      STATE.pointerGuardBound = true;
+    }
   }
 
   function selectAllVisible() {
@@ -1054,6 +1287,7 @@
 
     STATE.running = true;
     STATE.stopRequested = false;
+    writeRunLockFlag();
     clearCompletionReturnUrl();
     updateButtonStates();
     setStatus(`${resumed ? 'Resuming' : 'Starting'} bulk unsubscribe (${job.pending.length} remaining)`);
@@ -1127,6 +1361,7 @@
 
       if (stoppedEarly) {
         clearStoredJob();
+        clearRunLockFlag();
         clearCompletionReturnUrl();
         const stoppedStatus = buildJobStatusText(job, true);
         setStatus(stoppedStatus, job.failed.length > 0);
@@ -1254,6 +1489,37 @@
 
       .amz-bulk-running .amz-bulk-unsub-checkbox {
         display: none !important;
+      }
+
+      #amz-bulk-interaction-lock {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483646;
+        display: none;
+        pointer-events: none;
+        background: rgba(15, 23, 42, 0.08);
+        cursor: not-allowed;
+      }
+
+      .amz-bulk-running #amz-bulk-interaction-lock {
+        display: block;
+        pointer-events: auto;
+      }
+
+      #amz-bulk-interaction-lock .amz-bulk-lock-message {
+        position: fixed;
+        left: 50%;
+        top: 16px;
+        transform: translateX(-50%);
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid #cbd5e1;
+        background: rgba(255, 255, 255, 0.94);
+        color: #0f172a;
+        font: 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.22);
+        user-select: none;
+        pointer-events: none;
       }
 
       #amz-bulk-unsub-panel {
@@ -1447,6 +1713,7 @@
     STATE.runBtn = panel.querySelector('#amz-bulk-run');
     STATE.stopBtn = panel.querySelector('#amz-bulk-stop');
     STATE.logEl = panel.querySelector('#amz-bulk-unsub-log');
+    createInteractionLockLayer();
 
     panel.querySelector('#amz-bulk-select-all').addEventListener('click', selectAllVisible);
     panel.querySelector('#amz-bulk-clear').addEventListener('click', clearSelection);
@@ -1464,6 +1731,18 @@
   }
 
   function init() {
+    const activeJob = hasActiveStoredJob();
+    const completionPendingRedirect = hasCompletionRedirectIntent();
+    const runLockActive = hasRunLockFlag();
+
+    // If a job is in progress or completion redirect is pending and we are on an intermediate page,
+    // lock interactions immediately to avoid accidental clicks/navigation.
+    if (!isSubscriptionListPage() && (runLockActive || activeJob || completionPendingRedirect)) {
+      injectStyles();
+      createInteractionLockLayer();
+      updateButtonStates();
+    }
+
     if (isSubscriptionListPage()) {
       try {
         sessionStorage.removeItem(MANAGER_REDIRECT_GUARD_KEY);
@@ -1473,6 +1752,9 @@
       }
       writeLastSubscriptionListUrl(location.href);
       clearCompletionReturnUrl();
+      if (!activeJob) {
+        clearRunLockFlag();
+      }
     }
 
     if (isManagerViewPage() && maybeRedirectFromManagerPage()) {
